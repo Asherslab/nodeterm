@@ -803,6 +803,12 @@ const api: NodeTerminalApi = {
     return () => ipcRenderer.removeListener(IPC.browserControlResolve, handler)
   },
   sendBrowserControlResolveResult: (payload) => ipcRenderer.send(IPC.browserControlResolveResult, payload),
+  // Focus custody: one drive action is over, so the renderer may hand the user's focus back.
+  onBrowserFocusRelease: (listener) => {
+    const handler = (_e: unknown, req: unknown) => listener(req as never)
+    ipcRenderer.on(IPC.browserFocusRelease, handler)
+    return () => ipcRenderer.removeListener(IPC.browserFocusRelease, handler)
+  },
   agentMessage: {
     deliver: (req) => ipcRenderer.invoke(IPC.agentMessageDeliver, req)
   }

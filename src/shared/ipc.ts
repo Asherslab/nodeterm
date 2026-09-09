@@ -495,6 +495,9 @@ export const IPC = {
   // does the CDP work itself; the renderer never runs a CDP command.
   browserControlResolve: 'browser:control-resolve',
   browserControlResolveResult: 'browser:control-resolve-result',
+  /** Fire-and-forget, main → renderer: one browser drive action has finished, so give the user back
+   *  the focus the guest was granted for it (see core/browser-verb `actionNeedsGuestFocus`). */
+  browserFocusRelease: 'browser:focus-release',
   remoteHostStart: 'remote:host:start',
   remoteHostStop: 'remote:host:stop',
   // Connection approval gate: main → renderer when a client finishes the handshake (carries the
