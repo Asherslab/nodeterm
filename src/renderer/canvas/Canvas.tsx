@@ -252,6 +252,17 @@ import {
   answerBrowserResolve,
   type BrowserResolveProject
 } from '../lib/controlRouting'
+import { createFocusCustody } from '../lib/browserFocusCustody'
+import {
+  grantBrowserFocus,
+  focusIsOnBrowserNode,
+  isBrowserSurfaceElement
+} from '../nodes/browserFocusTargets'
+
+/** Focus custody for agent-driven browser actions. MODULE-level, like the terminal's `copySubs`:
+ *  the grant and the release arrive as two separate IPC messages, and the Canvas effects that carry
+ *  them mount once each with empty deps. One drive runs at a time (main serialises the verb). */
+const browserFocusCustody = createFocusCustody()
 import {
   coldGroupCwd,
   coldGroupChildCount,
@@ -8836,17 +8847,47 @@ export function Canvas() {
   // drive — and we NEVER run a CDP command. Main makes the security decision (owner + capability +
   // the CDP allowlist) and does the driving itself (browser-drive.ts / browser-actions.ts).
   useEffect(() => {
-    return api.onBrowserControlResolve(({ requestId, sourceNodeId, browserNodeId }) => {
-      const { projects, activeProjectId } = useProjects.getState()
-      const route = routeControlSource(projects, activeProjectId, sourceNodeId)
-      // Bring the owning project's canvas up so main can find the live guest (needsLiveCanvas is true
-      // for `browser`). A closed/blocked/unknown owner just yields the refusal below.
-      if (route.kind === 'switch' || route.kind === 'reopen') travelToProjectRef.current(route.projectId)
+    return api.onBrowserControlResolve(({ requestId, sourceNodeId, browserNodeId, needsGuestFocus }) => {
+      const { projects } = useProjects.getState()
+      // NO TRAVEL. This used to activate the owning project's tab so main would find a live guest —
+      // and that was a view hijack of exactly the G5 kind `send`/`reply`/`open-*` are declared
+      // store-answered/cold-openable to avoid: a background agent clicking a page yanked the user's
+      // tab, camera and viewport across on its own say-so, mid-sentence.
+      //
+      // It is also unnecessary. [MEASURED, Electron 42.x probe]: a `<webview>` whose element is
+      // `display:none` — which is exactly what a background project's keep-alive GHOST is
+      // (lib/webviewKeepAlive) — is fully drivable over CDP: click, insertText and Runtime.evaluate
+      // all landed on the hidden guest. A project whose canvas was never shown in this run has no
+      // guest at all, and that already has its own honest answer from main
+      // (`browserDiscardedMessage` / `no drivable browser node`), which is a lifecycle sentence, not
+      // a hijack.
+      //
+      // What the drive DOES need is the app's keyboard focus while it dispatches input, and taking
+      // that is the second half of the same bug (the user's cursor leaving the agent's prompt box).
+      // So it is granted here, for input-dispatching actions only, and given back on
+      // `onBrowserFocusRelease` the moment the action ends.
+      if (needsGuestFocus && browserNodeId) {
+        const active = document.activeElement as (HTMLElement & { isConnected: boolean }) | null
+        browserFocusCustody.remember(active, isBrowserSurfaceElement(active))
+        grantBrowserFocus(browserNodeId)
+      }
       const owner = projects.find((p) => p.nodes.some((n) => n.id === sourceNodeId))
       // `browserNodeId` is passed so the answer can carry the browser node's title for the cookie
       // trace; the security decision main makes never reads it.
       const answer = answerBrowserResolve(owner as unknown as BrowserResolveProject | undefined, sourceNodeId, browserNodeId)
       api.sendBrowserControlResolveResult({ requestId, ...answer })
+    })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  // The other half of focus custody: main says the drive action is over, so put the user's focus
+  // back — but only if it is still parked on the guest we granted it to. If the user has clicked
+  // somewhere themselves since (including into that browser node deliberately), the focus is theirs
+  // and the drive does not move it. Restoring any earlier than this breaks the drive itself: with
+  // the embedder focused elsewhere a following `Input.insertText` lands nowhere [MEASURED].
+  useEffect(() => {
+    return api.onBrowserFocusRelease(({ browserNodeId }) => {
+      browserFocusCustody.release(focusIsOnBrowserNode(browserNodeId))
     })
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])

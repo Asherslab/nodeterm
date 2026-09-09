@@ -222,3 +222,31 @@ export function parseBrowserArgs(args: Record<string, string>): BrowserCall | { 
     times: positiveInt(args.times)
   }
 }
+
+/**
+ * Focus custody: which actions dispatch `Input.*` into the guest and therefore need the guest to
+ * hold the app's keyboard focus while they run — and consequently owe the user their focus back
+ * afterwards.
+ *
+ * WHY [MEASURED, Electron 42.x, standalone probe]:
+ *   - A CDP `Input.*` dispatch into a `<webview>` does NOT take the OS window/app focus (an
+ *     unfocused window stayed unfocused) but DOES move the embedder's `document.activeElement` onto
+ *     the `<webview>` element — the whole "the agent's page click yanked my cursor out of the
+ *     prompt box" bug.
+ *   - Restoring that focus MID-action breaks the drive: with the embedder focused elsewhere a
+ *     following `Input.insertText` landed nowhere. Restoration therefore happens strictly AFTER the
+ *     action, and the next action re-grants the guest focus first — which restores the page's own
+ *     focused element, so `--type` with no `--into` still works across a restore.
+ *   - Reads, `--nav`, `--screenshot`, `--cookies` and `--wait` dispatch no input: they must not
+ *     touch the user's focus at all, which is why this is a set and not "every browser call".
+ */
+const FOCUS_DISPATCHING_KINDS: ReadonlySet<BrowserAction['kind']> = new Set([
+  'click',
+  'type',
+  'press',
+  'scroll'
+])
+
+export function actionNeedsGuestFocus(kind: BrowserAction['kind']): boolean {
+  return FOCUS_DISPATCHING_KINDS.has(kind)
+}

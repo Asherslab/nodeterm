@@ -8,6 +8,7 @@ import { reloadWebview, type ReloadableWebview } from './webviewReload'
 import { describeLoadFailure, isReportableFailure, type WebviewLoadFailure } from './webviewError'
 import { WebviewErrorPlate } from './WebviewErrorPlate'
 import { WebviewLoadingBar } from './WebviewLoadingBar'
+import { registerBrowserFocusTarget } from './browserFocusTargets'
 
 // Minimal typing for the Electron <webview> element methods/events we use.
 type WebviewEl = HTMLElement & {
@@ -200,6 +201,12 @@ export function BrowserSurface({
       if (wcId) window.nodeTerminal.browser.unregister(wcId)
     }
   }, [nodeId, discarded])
+
+  // Focus custody (agent-driven `browser` verb): publish this surface's <webview> so Canvas can
+  // grant it the app's keyboard focus for the length of one drive action and hand the user's focus
+  // back afterwards. Registration is by node id and both mount sites register, which is why the
+  // registry keeps a SET per id (canvas node + kanban card modal can be live at once).
+  useEffect(() => registerBrowserFocusTarget(nodeId, { el: () => ref.current }), [nodeId])
 
   // ── Memory saver ────────────────────────────────────────────────────────────────────────────
   // A browser node parked off-screen is a whole Chromium renderer process doing nothing, and the

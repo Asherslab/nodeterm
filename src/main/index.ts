@@ -41,7 +41,7 @@ import {
   type BrowserResolve,
   type LiveGuest
 } from './browser-drive'
-import { parseBrowserArgs } from '../core/browser-verb'
+import { parseBrowserArgs, actionNeedsGuestFocus } from '../core/browser-verb'
 import { STRICT_CONTROL_REFUSAL } from '../core/agents/node-identity-policy'
 import {
   revokeBrowserNode,
@@ -3201,7 +3201,11 @@ app.whenReady().then(async () => {
   // Ask the renderer to resolve a source node — the `ask` closure `resolveBrowserTarget` races
   // against its own 2s timeout. The renderer NEVER runs a CDP command; it answers existence + project
   // + capability only.
-  const askRendererResolve = (sourceNodeId: string, browserNodeId: string): Promise<BrowserResolve> => {
+  const askRendererResolve = (
+    sourceNodeId: string,
+    browserNodeId: string,
+    needsGuestFocus: boolean
+  ): Promise<BrowserResolve> => {
     const w = getMainWindow()
     if (!w || w.isDestroyed()) {
       return Promise.resolve({ ok: false, refusal: 'source node is not on an open canvas' })
@@ -3212,7 +3216,16 @@ app.whenReady().then(async () => {
     })
     // `browserNodeId` rides along so the renderer can report the browser node's title for the cookie
     // trace; it is NOT part of the security decision (owner + capability + allowlist stay main-side).
-    w.webContents.send(IPC.browserControlResolve, { requestId, sourceNodeId, browserNodeId })
+    // `needsGuestFocus` rides the resolve because the resolve is the round trip that already happens
+    // immediately before the drive: the renderer grants the guest the app's keyboard focus for the
+    // input-dispatching actions only (core/browser-verb `actionNeedsGuestFocus`), and gets the
+    // user's focus back on `browserFocusRelease` below. Reads and `--nav` never touch focus.
+    w.webContents.send(IPC.browserControlResolve, {
+      requestId,
+      sourceNodeId,
+      browserNodeId,
+      needsGuestFocus
+    })
     return answered.finally(() => pendingBrowserResolve.delete(requestId))
   }
   // The `browser` verb's whole main-side drive: parse (pure), identity belt, resolve round-trip, then
@@ -3228,7 +3241,10 @@ app.whenReady().then(async () => {
     // Identity is checked first (the belt to hook-server's verified-only gate for STRICT verbs): a
     // non-verified caller learns nothing, and no resolve round-trip is even made.
     if (!verified) return { ok: false, error: STRICT_CONTROL_REFUSAL, message: STRICT_CONTROL_REFUSAL }
-    const resolve = await resolveBrowserTarget(parsed.node, () => askRendererResolve(nodeId, parsed.node))
+    const needsGuestFocus = actionNeedsGuestFocus(parsed.action.kind)
+    const resolve = await resolveBrowserTarget(parsed.node, () =>
+      askRendererResolve(nodeId, parsed.node, needsGuestFocus)
+    )
     const result = await driveBrowser(
       { call: parsed, ownerNodeId: nodeId, verified, resolve },
       {
@@ -3248,6 +3264,16 @@ app.whenReady().then(async () => {
         }
       }
     )
+    // Hand the user's focus back the moment the action is over — win or lose, and even when the
+    // gate refused after the grant (a refusal must not leave the focus parked on a page). Restoring
+    // any EARLIER breaks the drive: with the embedder focused elsewhere a following
+    // `Input.insertText` lands nowhere [MEASURED].
+    if (needsGuestFocus) {
+      const w = getMainWindow()
+      if (w && !w.isDestroyed()) {
+        w.webContents.send(IPC.browserFocusRelease, { browserNodeId: parsed.node })
+      }
+    }
     return result.ok
       ? { ok: true, message: result.message }
       : { ok: false, error: result.message, message: result.message }

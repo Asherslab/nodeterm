@@ -3262,8 +3262,19 @@ export interface NodeTerminalApi {
    *  node's owning project, control-capability and the LIVE per-project capability value. The
    *  renderer answers over `sendBrowserControlResolveResult` and NEVER runs a CDP command. */
   onBrowserControlResolve(
-    listener: (req: { requestId: string; sourceNodeId: string; browserNodeId?: string }) => void
+    listener: (req: {
+      requestId: string
+      sourceNodeId: string
+      browserNodeId?: string
+      /** The action about to run dispatches `Input.*` into the guest, so the guest needs the app's
+       *  keyboard focus while it does. The renderer grants it here (the resolve already round-trips
+       *  immediately before the drive) and hands the user's focus back on `onBrowserFocusRelease`. */
+      needsGuestFocus?: boolean
+    }) => void
   ): () => void
+  /** One browser drive action has finished: restore the focus the matching resolve took, if it is
+   *  still sitting on that node's guest. */
+  onBrowserFocusRelease(listener: (req: { browserNodeId: string }) => void): () => void
   /** Answer a browser-control resolve. `ok:false` carries a named refusal; `ok:true` carries the
    *  facts main turns into its own (owner + capability + CDP-gate) decision. `sourceTitle`/
    *  `browserTitle` are for the cookie-read trace only (PR 9) — never a security input. */

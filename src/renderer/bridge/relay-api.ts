@@ -155,6 +155,7 @@ export function buildRelayApi(connectionId: string, transport?: FrameTransport):
     sendAgentControlResult: stub.sendAgentControlResult,
     // Browser control never rides the relay either (no CDP off the desktop) — inert no-ops.
     onBrowserControlResolve: stub.onBrowserControlResolve,
+    onBrowserFocusRelease: stub.onBrowserFocusRelease,
     sendBrowserControlResolveResult: stub.sendBrowserControlResolveResult,
     // Messaging rides the same decision: the browser client is never a sender (constraint 5 of
     // the messaging plan — the phone drives canvas control over relay→IPC, not /control/*).
