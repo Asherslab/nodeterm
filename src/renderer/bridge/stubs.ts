@@ -506,6 +506,9 @@ export function buildStubApi(): Omit<
     // Browser control is desktop-only (no <webview>, no CDP on the Server Edition / relay), so the
     // resolve round-trip is inert here — the verb is refused by name before it reaches a handler.
     onBrowserControlResolve: noopUnsub,
+    // Server Edition / relay: there is no browser control at all (the node renders in the viewer's
+    // own browser tab, which the server cannot drive), so nothing ever takes focus to give back.
+    onBrowserFocusRelease: noopUnsub,
     sendBrowserControlResolveResult: noop,
     // Messaging never runs in the browser: `onAgentControl` above is inert here, so no dispatch
     // can ever reach this. It answers the honest terminal refusal all the same, so a stray call

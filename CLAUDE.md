@@ -925,6 +925,32 @@ session.
 - **browser** (`BrowserNode.tsx`) — a navigable Chromium browser wrapping the shared
   `BrowserSurface` (webview + toolbar); the last top-level URL persists to `data.url`, and the same
   surface backs the kanban card modal's browser popup.
+  **An agent driving one must never move the user** (the `browser` verb; `main/index.ts`
+  `handleBrowserVerb` + Canvas's `onBrowserControlResolve`). Two separate hijacks, both measured on
+  Electron 42.x with a standalone probe rather than reasoned about:
+  - **Tab/camera.** The resolve round-trip used to `travelToProjectRef` to the owning project so
+    main would find a live guest — a background agent's page click yanked the user's tab, camera and
+    viewport across, the same G5 hijack `send`/`reply`/`open-*` are declared store-answered /
+    cold-openable to avoid. It is also unnecessary: a `<webview>` whose element is `display:none` —
+    which is exactly a background project's keep-alive GHOST — is FULLY drivable (click, insertText
+    and Runtime.evaluate all landed on the hidden guest). Travel is gone; a project whose canvas was
+    never shown in this run has no guest and already has its own honest lifecycle sentence
+    (`browserDiscardedMessage` / `no drivable browser node`).
+  - **Keyboard focus.** A CDP `Input.*` dispatch does NOT take the OS window or app focus (an
+    unfocused window stayed unfocused, for click, type, wheel, navigate and screenshot alike — so
+    the window-switching half of a report is NOT this path) but it DOES move the embedder's
+    `document.activeElement` onto the `<webview>`, which is the cursor leaving the agent's prompt
+    box. The fix is **custody, not prevention**: restoring the focus mid-action breaks the drive (a
+    following `Input.insertText` landed nowhere), so the guest is granted focus at the resolve and
+    the user's element is restored when the action ENDS, win, lose or refused. Re-granting at the
+    next action restores the page's OWN focused element, so `--type` with no `--into` survives a
+    restore. Only the input-dispatching kinds take part (`actionNeedsGuestFocus` — click/type/press/
+    scroll); reads, `--nav`, `--screenshot`, `--cookies` and `--wait` must not touch focus at all.
+    Decisions are the pure `renderer/lib/browserFocusCustody.ts`; the live `<webview>`s are published
+    through the module-level `nodes/browserFocusTargets.ts` (a SET per node id — the canvas node and
+    the kanban card modal can both be mounted for one id). A restore fires only while the focus is
+    still on that guest, so a user who clicked somewhere themselves keeps it. Server Edition/relay:
+    inert (`onBrowserFocusRelease` is a noop stub — there is no browser control there at all).
 - **files** (`FilesNode.tsx`) — a file-manager node: ONE directory listing (`data.cwd`, persisted),
   pinned to the canvas beside the terminals working in it. Deliberately not a second Explorer: the
   drawer is a single tree rooted at the project cwd that covers the canvas, so it gives you one
