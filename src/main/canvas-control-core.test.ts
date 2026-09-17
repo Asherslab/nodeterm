@@ -19,6 +19,10 @@ import { STRICT_CONTROL_VERBS } from '../core/agents/node-identity-policy'
 import { BROWSER_ACTION_KEYS } from '../core/browser-verb'
 import { BROWSER_RETRYABLE, BROWSER_OUTCOME_LABEL } from '../core/browser-outcomes'
 import { BROWSER_CAPABILITY_OFF_MESSAGE } from './browser-drive'
+import {
+  offScreenDisposition,
+  controlVerbSetsForTests
+} from '../shared/control-off-screen'
 
 describe('parseControlRequest', () => {
   it('accepts known verbs', () => {
@@ -459,6 +463,32 @@ describe('parseControlRequest', () => {
     }
   })
 
+  it('both agent-facing texts say `close` takes a COMMA LIST, confirmed in ONE dialog', () => {
+    for (const body of [buildCanvasSkillBody('/x/shim.sh'), buildCanvasControlInstructions('/tmp/nodeterm.sh')]) {
+      // The grammar exists on both surfaces now (the desktop used to read the whole flag as one
+      // id), and an orchestrator that does not know it closes a finished wave one call at a time —
+      // which is one dialog per node, with every call after the first refused while a dialog is
+      // open. That was the reported pain; the text is what makes the fix reachable.
+      expect(body).toContain('close --node <id,id>')
+      expect(body.toUpperCase()).toContain('COMMA LIST')
+      expect(body.toUpperCase()).toContain('ONE dialog'.toUpperCase())
+      // …and that a bad id refuses the WHOLE list, so a caller does not have to guess which of its
+      // fourteen nodes survived.
+      expect(body).toMatch(/refuses the whole request/i)
+    }
+  })
+
+  it('the skill tells an agent NOT to retry a denial in the hope the dialog is off', () => {
+    // A user may waive a verb's dialog (for the session, or permanently). The verb then just
+    // applies, and the caller cannot tell which happened — so the one behaviour to rule out
+    // explicitly is re-sending a `denied by user` request to see whether it lands this time.
+    const body = buildCanvasSkillBody('/x/shim.sh')
+    expect(body).toMatch(/never re-send a `denied by user` request/i)
+    // And "a confirmation is already pending" must not read as an invitation to spin.
+    expect(body).toContain('a confirmation is already pending')
+    expect(body).toMatch(/do not spin/i)
+  })
+
   it('both agent-facing texts state the Server creator-ownership and inert-boot contract', () => {
     for (const body of [buildCanvasSkillBody('/x/shim.sh'), buildCanvasControlInstructions('/tmp/nodeterm.sh')]) {
       expect(body).toContain('ownership is fail-closed')
@@ -740,5 +770,75 @@ describe('the --project clause tells the truth about travel (review #363 I-1 + M
       expect(body, `${name}: closed project`).toMatch(/closed/i)
       expect(body, `${name}: tab not reopened`).toMatch(/not reopened/i)
     }
+  })
+
+  it('both bodies say the DISPLAY verbs do not switch the view either — and are never queued', () => {
+    // The second half of the same promise, and the half an agent meets most often: a skill that
+    // renders its report as HTML reaches for `show-web` every time it finishes. Two facts it acts
+    // on, and the second is why these are not folded into the cold-open sentence: the node is
+    // COMPLETE when placed, so a caller told "queued" would wait for something that has already
+    // happened. The `offCanvas` field is what it reads instead.
+    for (const [name, body] of bodies) {
+      const start = body.indexOf('`show-image')
+      const end = body.indexOf('`group --nodes', start)
+      expect(start, `${name}: the display-verb entries`).toBeGreaterThan(-1)
+      expect(end, `${name}: the group entry after them`).toBeGreaterThan(start)
+      const clause = body.slice(start, end)
+      expect(clause, `${name}: never switches the view`).toMatch(/never switch(es)? the user'?s view/i)
+      expect(clause, `${name}: names the field`).toContain('offCanvas')
+      // THE STALE CLAIM the split exists to prevent: a display verb reported as queued.
+      expect(clause, `${name}: not queued`).toMatch(/nothing (here )?is (ever )?\`?queued/i)
+    }
+  })
+
+  it('both bodies render the OFF-SCREEN table, and render it from the table', () => {
+    // CLAUDE.md's rule for this subsystem: derive, never re-type — "a doc line with no such test
+    // is a plan, not a fact". The two sides of the table have OPPOSITE consequences for a caller
+    // (act, or ask the human and stop), so a verb documented on the wrong side is worse than one
+    // documented nowhere: an orchestrator would report as done a `close` that never happened.
+    const sets = controlVerbSetsForTests()
+    const answered = [
+      ...sets.storeAnswered,
+      ...sets.coldOpenable,
+      ...sets.offCanvas,
+      ...sets.storedNode
+    ]
+    for (const [name, body] of bodies) {
+      expect(body, `${name}: the promise`).toMatch(/NO VERB EVER SWITCHES THE USER'S VIEW/)
+      const start = body.indexOf("NO VERB EVER SWITCHES THE USER'S VIEW")
+      const end = body.indexOf('Messaging outcomes', start)
+      expect(end, `${name}: the messaging block after it`).toBeGreaterThan(start)
+      const clause = body.slice(start, end)
+      for (const v of answered) {
+        expect(clause, `${name}: ${v} is answered off screen`).toContain(v)
+        expect(offScreenDisposition(v).kind, v).not.toBe('refuse')
+      }
+      // Every refused verb is named AND carries its own reason — a bare list would tell an agent
+      // that `branch` and `arrange` fail for the same cause, and they do not.
+      for (const v of ['group', 'ungroup', 'move', 'arrange', 'align', 'verify', 'spawn-team', 'branch', 'open-worktree', 'close-worktree', 'browser']) {
+        const d = offScreenDisposition(v)
+        expect(d.kind, v).toBe('refuse')
+        if (d.kind !== 'refuse') continue
+        expect(clause, `${name}: ${v}'s reason`).toContain(`${v}: ${d.why}`)
+      }
+      // What the caller must DO about a refusal. Without this an agent retries on a timer against
+      // a project the user may not open for hours.
+      expect(clause, `${name}: what to do`).toMatch(/Ask the user to open it/)
+      expect(clause, `${name}: do not retry on a timer`).toMatch(/do not\s+retry it on a timer/)
+      expect(clause, `${name}: do not report done`).toMatch(/do not report the action as done/)
+    }
+  })
+
+  it('the off-screen table never claims a verb is BOTH answered and refused', () => {
+    // The rendering reads two sources; a verb added to a set without being removed from
+    // OFF_SCREEN_REFUSALS would appear on both sides of the same paragraph.
+    const sets = controlVerbSetsForTests()
+    const answered = new Set([
+      ...sets.storeAnswered,
+      ...sets.coldOpenable,
+      ...sets.offCanvas,
+      ...sets.storedNode
+    ])
+    for (const v of answered) expect(offScreenDisposition(v).kind, v).not.toBe('refuse')
   })
 })

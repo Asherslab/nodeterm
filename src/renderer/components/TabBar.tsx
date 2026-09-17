@@ -12,7 +12,7 @@ import { sessionCount, sessionForProject, useProjectSession } from '../session/s
 import { tabClickAction } from '../session/relay-tab'
 import { useMenuFlip } from '../ui/useMenuFlip'
 import { commandTooltip } from '../lib/keybindingOverrides'
-import { IconCanvasView, IconKanban } from './icons'
+import { IconCanvasView, IconKanban, IconMoreVertical, IconPlus } from './icons'
 import { ProjectGlyph } from './ProjectGlyph'
 import {
   ALL_PERMISSION_MODES,
@@ -212,6 +212,24 @@ export function TabBar({
       ?.scrollIntoView({ behavior: 'smooth', inline: 'nearest', block: 'nearest' })
   }, [activeId, projects.length])
 
+
+  // The backdrop deliberately sits BELOW the bar, so a click on another tab switches to it in one
+  // go instead of being swallowed as a dismiss — which leaves the bar itself (its empty stretch,
+  // the brand, the +) unable to close the menu. This covers exactly that gap, and it closes
+  // WITHOUT consuming the event, so the click still lands wherever it was aimed.
+  useEffect(() => {
+    if (!menuId) return
+    const onDown = (e: PointerEvent): void => {
+      const el = e.target as HTMLElement | null
+      // The caret owns its own toggle; closing here first would let its click re-open the menu.
+      if (el?.closest('.tab-menu, .tab__caret')) return
+      closeMenu()
+    }
+    document.addEventListener('pointerdown', onDown, true)
+    return () => document.removeEventListener('pointerdown', onDown, true)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [menuId])
+
   return (
     <>
       {(menuId || editingId) && (
@@ -226,7 +244,7 @@ export function TabBar({
 
       <div className="tabbar">
         <div className="brand">
-          <svg className="brand__mark" viewBox="0 0 48 48" width="26" height="26" aria-hidden="true">
+          <svg className="brand__mark" viewBox="0 0 48 48" width="22" height="22" aria-hidden="true">
             <defs>
               <linearGradient id="ntg" x1="0" y1="0" x2="1" y2="1">
                 <stop offset="0" stopColor="#a38dff" />
@@ -273,8 +291,12 @@ export function TabBar({
             return (
               <div
                 key={p.id}
-                className={`tab${active ? ' active' : ''}${swimlaneHighlight ? ' tab--swimlane-highlight' : ''}${p.unavailable ? ' unavailable' : ''}${dropId === p.id ? ' is-drop-before' : ''}`}
-                style={active ? { color: p.color } : undefined}
+                className={`tab${active ? ' active' : ''}${swimlaneHighlight ? ' tab--swimlane-highlight' : ''}${p.unavailable ? ' unavailable' : ''}${dropId === p.id ? ' is-drop-before' : ''}${menuId === p.id ? ' tab--menu-open' : ''}`}
+                // The project colour rides the GLYPH (below), not the label: `.tab.active` is
+                // neutral text on the page's own surface, like a browser tab. The one exception is
+                // the swimlane highlight, whose underline is `currentColor` and is meant to be the
+                // project's colour.
+                style={swimlaneHighlight ? { color: p.color } : undefined}
                 draggable={editingId !== p.id}
                 onDragStart={(e) => {
                   e.dataTransfer.effectAllowed = 'move'
@@ -368,54 +390,68 @@ export function TabBar({
                   </span>
                 )}
 
-                {active && editingId !== p.id && (
-                  // The title was a hardcoded `(⌘⇧B)` — mac glyphs shown to Linux/Windows users
-                  // (a pre-existing bug: it was never even hintLabel-wrapped), and stale after a
-                  // remap. `commandTooltip` fixes both and drops the chord entirely when the
-                  // command is unbound.
-                  <button
-                    className="tab__board-toggle"
-                    title={commandTooltip(
-                      kanbanActive ? 'Canvas view' : 'Kanban view',
-                      'view.kanbanToggle'
+                {editingId !== p.id && (
+                  // The actions are one cluster with its own rhythm, not two more items in the
+                  // tab's label row: they sit a hair apart from each other and further from the
+                  // name than the name's own parts sit from one another.
+                  <span className="tab__actions">
+                    {active && (
+                      // On the ACTIVE tab only: the toggle says which view you are looking at, and
+                      // on an inactive tab it would flip a project's view without taking you
+                      // there. The chord comes from `commandTooltip`, so a remap or an unbound
+                      // command is not advertised as a chord that no longer works.
+                      <button
+                        className="tab__board-toggle"
+                        title={commandTooltip(
+                          kanbanActive ? 'Canvas view' : 'Kanban view',
+                          'view.kanbanToggle'
+                        )}
+                        aria-label={kanbanActive ? 'Canvas view' : 'Kanban view'}
+                        onClick={(e) => {
+                          e.stopPropagation() // a tab click switches projects, this flips the view
+                          const vm = useViewMode.getState()
+                          const settings = useSettings.getState().settings
+                          const omni = isOmniKanbanEnabled(settings)
+                          const asDefault = settings.omniKanbanAsDefault === true
+                          // Closing: the global overlay is exclusive, so any board toggle while
+                          // it is open closes it.
+                          if (vm.globalKanban) {
+                            vm.toggleGlobalKanban()
+                            return
+                          }
+                          if (omni && asDefault) {
+                            vm.toggleGlobalKanban()
+                          } else {
+                            vm.toggle(p.id)
+                          }
+                        }}
+                      >
+                        {kanbanActive ? <IconCanvasView /> : <IconKanban />}
+                      </button>
                     )}
-                    onClick={(e) => {
-                      e.stopPropagation() // a tab click switches projects, this only flips the view
-                      const vm = useViewMode.getState()
-                      const settings = useSettings.getState().settings
-                      const omni = isOmniKanbanEnabled(settings)
-                      const asDefault = settings.omniKanbanAsDefault === true
-                      // Closing: global overlay is exclusive — any board toggle while it's open closes it.
-                      if (vm.globalKanban) {
-                        vm.toggleGlobalKanban()
-                        return
-                      }
-                      if (omni && asDefault) {
-                        vm.toggleGlobalKanban()
-                      } else {
-                        vm.toggle(p.id)
-                      }
-                    }}
-                  >
-                    {kanbanActive ? <IconCanvasView /> : <IconKanban />}
-                  </button>
-                )}
-                {active && editingId !== p.id && (
-                  <button
-                    className="tab__caret"
-                    title="Project options"
-                    onClick={(e) => {
-                      e.stopPropagation()
-                      if (menuId === p.id) closeMenu()
-                      else openMenu(p.id, e.currentTarget)
-                    }}
-                  >
-                    ⌄
-                  </button>
+                    <button
+                      className="tab__caret"
+                      title="Project options"
+                      aria-label="Project options"
+                      onClick={(e) => {
+                        e.stopPropagation()
+                        if (menuId === p.id) closeMenu()
+                        else openMenu(p.id, e.currentTarget)
+                      }}
+                    >
+                      <IconMoreVertical />
+                    </button>
+                  </span>
                 )}
               </div>
             )
           })}
+          {/* The end-of-strip drop zone (`dropId === ''`) had no marker at all — every other target
+              draws its line as the `::before` of the tab it lands in front of, and "after the last
+              one" has no such tab. It lives INSIDE the scroller so it lands after the last tab
+              rather than at the window edge. Rendered only mid-drag, and its negative margins
+              cancel its own width so appearing costs no layout shift. */}
+          {dragId && dropId === '' && <span className="tab__dropline" aria-hidden />}
           </div>
           <button
             type="button"
@@ -424,7 +460,7 @@ export function TabBar({
             aria-label="New project"
             onClick={onOpenWelcome}
           >
-            +
+            <IconPlus />
           </button>
         </div>
       </div>
