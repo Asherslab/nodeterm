@@ -7,7 +7,7 @@ import { readFile, realpath as fsRealpath, lstat as fsLstat, writeFile as fsWrit
 import { existsSync, statSync, openSync, fstatSync, readFileSync, closeSync } from 'fs'
 import { homedir, hostname } from 'os'
 import { randomUUID } from 'crypto'
-import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, Notification, powerMonitor, safeStorage, shell, systemPreferences, webContents } from 'electron'
+import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, Notification, powerMonitor, safeStorage, screen, shell, systemPreferences, webContents } from 'electron'
 import { IPC } from '../shared/ipc'
 
 // Debug log ring (issue #78): capture the process console from the first line — a packaged app
@@ -19,7 +19,8 @@ import { writeFilesToClipboard } from './clipboard-files'
 import { pickProjectIcon } from './project-icon-upload'
 import { allowGuestNavigation } from './webview-nav'
 import { hostOsFromPlatform, sshServerCopy } from '../shared/ssh-server'
-import { macTitleBarOptions } from './window-chrome'
+import { macTitleBarOptions, trafficLightPositionFor } from './window-chrome'
+import { resolveTabBarHeight } from '@shared/window-chrome-metrics'
 import { guestContextMenuTemplate } from './webview-context-menu'
 import { BrowserControlLedger } from './browser-control-ledger'
 import {
@@ -71,6 +72,7 @@ import {
   type AgentMessagingDeps
 } from '../core/agents/agent-messaging'
 import type { RemoteLogExec } from '../core/board-log'
+import type { TranscriptPresence } from '../shared/types'
 import { boardLogRemotePath } from '../core/board-log'
 import { PtyManager } from '../core/pty-manager'
 import { WorkspaceStore } from '../core/workspace-store'
@@ -187,6 +189,8 @@ import { installManagedAgentHooks } from '../core/agents/hooks'
 import { createSubagentTail } from '../core/subagent-tail'
 import { createContextTail, type TaskNotification } from '../core/context-tail'
 import { grokContextParse, GROK_SIGNALS_FILE } from '../core/grok-signals'
+import { GROK_CHAT_HISTORY_FILE } from '../core/agents/grok-paths'
+import { createGrokSubagentFormatter } from '../core/grok-subagent-format'
 import { geminiContextParse } from '../core/gemini-session'
 import { codexContextParse } from '../core/codex-session'
 import { createCodexSubagentFormatter } from '../core/codex-subagent-format'
@@ -217,16 +221,24 @@ import {
   remotePaneCommandArgs
 } from '../core/remote-ssh/control-master'
 import { planRemoteWorkspacePoll } from './remote-workspace-poll'
+import { planSshPrewarm, runSshPrewarm } from '../core/remote-ssh/ssh-prewarm'
 import { sessionName } from '../core/tmux-naming'
-import { posixQuote, type SshConnection } from '../shared/ssh'
+import { posixQuote, sshHostKey, type SshConnection } from '../shared/ssh'
 import { buildHandoff, type HandoffRemote } from './handoff'
 import { initContextLink, setNodeTranscript } from '../core/context-link'
 import { transcriptPathOf } from '../core/context-link-core'
 import { initCanvasControl, installCanvasSkillInto } from './canvas-control'
 import { DRY_RUN_VERBS, dryRunRequested, dryRunRefusal } from '../shared/control-verbs'
+import { CONTROL_REQUEST_TIMEOUT_MS } from '../shared/control-confirm'
 import { initTranscriptIndex, searchTranscripts } from '../core/transcript-index'
 import { initTelemetry } from './telemetry'
 import { initClaudeUsage } from './claude-usage'
+import {
+  readWindowState,
+  resolveWindowBounds,
+  trackWindowState,
+  writeWindowState
+} from './window-state'
 import { remoteUsageTargets } from '../core/usage/remote-claude-usage'
 import { initLicense, isPremium, getStoredEntitlement } from '../core/license'
 import { WhisperModelStore } from '../core/speech/whisper-models'
@@ -495,6 +507,32 @@ workspaceStore.onPersist = () => {
   workspaceWatcher.sync()
   refreshNodeTokens()
 }
+// "Which host owns this node?", answered WITHOUT a live session — the persisted index, not the
+// in-memory `Session`. A delete arrives precisely when there may be nothing attached (an app
+// restart, the offscreen release, the park timer, a project that is not even open), and core used
+// to read remoteness off the dying session alone: the remote `kill-session` was then skipped in
+// silence and the node's `nt-<id>` kept running on the host. See core/remote-end.ts.
+//
+// Wired here rather than in `ptyManager.init` because it needs BOTH the workspace store and the
+// SSH-project manager, and the manager is created much later — `sshProjectManager` is read inside
+// the closure, so an early delete simply sees no live master and records the debt.
+// The Server Edition wires none: it has no SSH-project manager, so its deletes stay local.
+ptyManager.setRemoteNodeOwner((nodeId) => {
+  const projectId = workspaceStore.sshProjectIdForNode(nodeId)
+  if (!projectId) return null
+  // The persisted endpoint is what makes the host NAMEABLE while it is unreachable — without it a
+  // debt could not be keyed, and an undeliverable kill would have to be dropped again.
+  const server = workspaceStore.projectTargetInfo(projectId)?.ssh?.server
+  if (!server) return null
+  // The LIVE conn (not the persisted one) when there is a master: it carries this run's pinned
+  // agent socket and trust provenance, and it is the same handle `killSessions` runs over.
+  const ref = sshProjectManager?.refForProject(projectId)
+  return {
+    projectId,
+    hostKey: sshHostKey(ref?.conn ?? server),
+    remote: ref ? { conn: ref.conn, controlPath: ref.controlPath } : undefined
+  }
+})
 const gitService = new GitService()
 
 // Project setup/archive runner (SDD: 2026-08-19-project-settings-trust). The trust store is keyed
@@ -930,9 +968,19 @@ function createWindow(): BrowserWindow {
         ? join(process.resourcesPath, 'icon.png')
         : join(__dirname, '../../build/icon.png')
       : undefined
+  // Reopen where the user left off (issue: the window forgot its size/position every launch).
+  // A throwaway NT_MULTI sandbox is deliberately excluded: it may share the real app's userData,
+  // and a dev instance must not move the window of the app being developed.
+  const windowStateDir = NT_MULTI ? null : app.getPath('userData')
+  const restored = resolveWindowBounds(
+    windowStateDir ? readWindowState(windowStateDir) : null,
+    // Work areas, not full display bounds: a saved position is checked against the space a window
+    // can actually occupy, which excludes the macOS menu bar, a GNOME top bar and any dock.
+    screen.getAllDisplays().map((d) => d.workArea),
+    { width: 1400, height: 900 }
+  )
   const win = new BrowserWindow({
-    width: 1400,
-    height: 900,
+    ...restored.bounds,
     show: false,
     backgroundColor: '#1e1e1e',
     // NT_MULTI instances are throwaway dev sandboxes: label the window so a second instance is
@@ -943,7 +991,9 @@ function createWindow(): BrowserWindow {
     // macOS-only in Electron, and the renderer's tab bar reserves its 86px of left padding for
     // exactly this window shape — so state the platform here rather than leaving it to Electron to
     // ignore the values elsewhere (issue #564). Windows/Linux keep their native frame, unchanged.
-    ...macTitleBarOptions(process.platform),
+    // The lights are centred on the user's tab-bar height (Settings → Appearance); a later change
+    // re-centres them live through the `settingsStore.onChange` hook below.
+    ...macTitleBarOptions(process.platform, resolveTabBarHeight(settingsStore.get().tabBarHeight)),
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
       contextIsolation: true,
@@ -959,6 +1009,21 @@ function createWindow(): BrowserWindow {
       plugins: true
     }
   })
+
+  // Maximize BEFORE the first paint. The window is `show: false` until `ready-to-show`, so doing it
+  // here means it is simply born maximized — maximizing after `show()` is a visible jump from the
+  // restored size to full screen on every single launch.
+  if (restored.maximize) win.maximize()
+  // Track from here on. The saves are debounced through ordinary resizing and flushed on `close`,
+  // so an ordinary quit always records the final state and a crash costs at most one gesture.
+  if (windowStateDir) {
+    const stopTrackingWindowState = trackWindowState(win, (state) =>
+      // Best-effort by contract: a window geometry that failed to save is not worth a dialog, and
+      // the previous record stands.
+      void writeWindowState(windowStateDir, state)
+    )
+    win.on('closed', stopTrackingWindowState)
+  }
 
   // Register as the live main window (send-time resolution via getMainWindow/sendToMain).
   setMainWindow(win)
@@ -1048,7 +1113,23 @@ function createWindow(): BrowserWindow {
     }
   })
 
-  win.on('ready-to-show', () => win.show())
+  // FIRST PAINT ONLY — `once`, never `on` (issue #737).
+  //
+  // `ready-to-show` fires on the first paint of EVERY main-frame navigation, not once per window.
+  // MEASURED on Electron 42.9.1 (the reporter ran 42.10.0): a `webContents.reload()` on a VISIBLE
+  // window emits it a second time, with `isVisible()` already true. The crash auto-reload above is
+  // an unattended background navigation, so a persistent listener called `win.show()` on a window
+  // that was already showing — and on macOS `show()` activates the app. That is nodeterm raising
+  // itself over whatever the user had just ⌘Tabbed to, with no user action anywhere in the chain.
+  //
+  // Nothing may bring the window forward without a user action. The exceptions are enumerated in
+  // `window-raise.guard.test.ts`, and all of them are a click: a notification tap, a HUD row, a
+  // Dock activate, a second launch, a file dropped onto a terminal.
+  //
+  // The gate is FIRST PAINT, not `isVisible()`. After macOS hide-on-close the window is hidden but
+  // alive, and an `isVisible()` gate would then `show()` it on a background reload — the same bug
+  // inverted, raising a window the user had deliberately put away.
+  win.once('ready-to-show', () => win.show())
   // The main window is a regular app window; establishing its Dock presence explicitly means the
   // later focusable:false Notch HUD panel can never leave the app looking like an accessory.
   win.on('show', () => assertRegularDockPresence())
@@ -1366,6 +1447,19 @@ app.whenReady().then(async () => {
     ptyManager.captureSession(persistKey, full)
   )
 
+  // The early-attach gate (see PtyManager.remoteSessionConfirmed). Registered here rather than in
+  // core's shared pty block because only the desktop shell has SSH projects at all; the browser
+  // bridge answers a documented `false`.
+  corePlatform.handle(
+    IPC.ptyRemoteSessionConfirmed,
+    (persistKey: string, sshRemote: { controlPath: string; conn: SshConnection }) =>
+      ptyManager.remoteSessionConfirmed(persistKey, sshRemote)
+  )
+
+  // The late cold-start check (PtyCreateResult.freshUnverified). Registered in core's shared pty
+  // block below on the server side too — this one is here beside its sibling.
+  corePlatform.handle(IPC.ptySessionAge, (persistKey: string) => ptyManager.sessionAgeSeconds(persistKey))
+
   // Gemini's title read needs the transcript path its own context tail already tracks (nothing
   // scans for it). That tail is created ~600 lines below with the rest of the hook plumbing, while
   // this deps object is consumed by the ptyReadSessionName handler just under here and by the
@@ -1430,9 +1524,15 @@ app.whenReady().then(async () => {
   // another app does NOT activate the destination app, so without this the drag-source keeps OS
   // keyboard focus and the user types into the wrong application. `getMainWindow()` (not the
   // focused window — there may be none) restores + shows + focuses.
-  ipcMain.on(IPC.appFocusWindow, () => {
+  ipcMain.on(IPC.appFocusWindow, (event) => {
     const w = getMainWindow()
     if (!w) return
+    // The SAME sender guard as `uiShortcutRecording` / `uiTerminalFocus` above, and for the same
+    // reason: a <webview> guest — a browser node showing an arbitrary page — is a webContents in
+    // this process, and this is the one renderer-reachable `app.focus({steal:true})` in the app.
+    // Without the guard a page could activate nodeterm over whatever the user was doing (the
+    // no-unconsented-raise rule of issue #737). Its two neighbours were guarded; this was not.
+    if (w.webContents.id !== event.sender.id) return
     if (w.isMinimized()) w.restore()
     w.show()
     // On macOS `win.focus()` alone won't pull us in front of the still-active drag-source app —
@@ -1893,6 +1993,8 @@ app.whenReady().then(async () => {
     return {
       enabled: s.notchHud,
       notchWidth: s.notchWidth,
+      align: s.notchAlign,
+      offsetY: s.notchOffsetY,
       hoverExpand: s.notchHoverExpand,
       percentMode: s.usagePercentMode
     }
@@ -1906,10 +2008,19 @@ app.whenReady().then(async () => {
   // any future live label) tracks the renderer's setting. The renderer is the sole settings
   // writer; a change persists through `settingsStore`, which fires this hook. No reverse IPC.
   // Keep-awake re-reads its enable flag on the same edge.
-  settingsStore.onChange(() => {
+  // The traffic lights sit INSIDE the tab bar on macOS, so a bar-height change re-centres them —
+  // a bar that shrinks under lights left at the old y looks broken at once. Change-gated: the
+  // hook fires on every settings write and the position call is a native round trip.
+  let trafficLightBarHeight = resolveTabBarHeight(settingsStore.get().tabBarHeight)
+  settingsStore.onChange((s) => {
     applyNotchHudSettings(notchTunables())
     buildAppMenu(win)
     keepAwake?.refresh()
+    const barHeight = resolveTabBarHeight(s.tabBarHeight)
+    if (barHeight !== trafficLightBarHeight && process.platform === 'darwin' && !win.isDestroyed()) {
+      trafficLightBarHeight = barHeight
+      win.setWindowButtonPosition(trafficLightPositionFor(barHeight))
+    }
   })
   // Keep awake while agents work (docs/superpowers/specs/2026-08-18-keep-awake-design.md): hold an
   // idle-sleep power assertion while a LOCAL agent node is working, released the moment the last
@@ -1974,11 +2085,25 @@ app.whenReady().then(async () => {
   // by a timer below; `get()` is sync so it can sit behind `getGrants`. See
   // core/remote-push-grants.ts.
   const remoteGrants = createRemoteGrantsCache()
-  /** Local grants first (this machine's own phone), then the hosts'. ORDER MATTERS: one phone that
-   *  reached both this Mac and an SSH host dropped a different token on each, and push-notify's
-   *  `dedupeGrantsByDevice` keeps the FIRST occurrence per deviceId — so the local token, the one
-   *  that needs no host round-trip to stay fresh, is the survivor. */
+  /** This machine's own grants (untagged) plus every connected host's (tagged `host`). They are NOT
+   *  collapsed per phone any more: one phone that reached both this Mac and an SSH host dropped a
+   *  different token on each, each signed for its connectionId for THAT host, and push-notify routes
+   *  a node's events to the grants of the node's own host (`grantHostFor` below). Collapsing them
+   *  sent a remote host's events under another host's grant, past the phone's per-host mute
+   *  (issue #435). */
   const allPushGrants = (): PushGrant[] => [...pushGrants.get(), ...remoteGrants.get()]
+  /** The SSH host a node lives on, for the granted leg's per-host routing — or undefined for a
+   *  local node. Resolved from the project's INDEX entry (`projectTargetInfo`), not the live
+   *  connection: a remote node whose host is momentarily disconnected must still not fall back to
+   *  "local" and ride out under this Mac's own grant. An ssh project with no resolvable host key
+   *  gets a key that matches no grant, so its events are dropped from the granted leg rather than
+   *  misattributed (the relay leg still carries them). */
+  const pushGrantHostFor = (nodeId: string): string | undefined => {
+    const projectId = workspaceStore.sshProjectIdForNode(nodeId)
+    if (!projectId) return undefined
+    const ssh = workspaceStore.projectTargetInfo(projectId)?.ssh
+    return ssh ? sshHostKey(ssh.server) : `ssh:${projectId}`
+  }
   /** A 401/403 could be on either side's token; neither accessor knows the other's. */
   const markPushGrantDead = (grant: string): void => {
     pushGrants.markDead(grant)
@@ -2066,6 +2191,7 @@ app.whenReady().then(async () => {
     // block comment above). resolveTarget keeps a single sender: host wins when paired.
     getGrants: allPushGrants,
     markGrantDead: markPushGrantDead,
+    grantHostFor: pushGrantHostFor,
     hostLabel: () => hostname(),
     mobilePushEnabled: () => settingsStore.get().mobilePushEnabled !== false,
     mobilePushNeedsYou: () => settingsStore.get().mobilePushNeedsYou !== false,
@@ -2102,6 +2228,7 @@ app.whenReady().then(async () => {
         : null,
     getGrants: allPushGrants,
     markGrantDead: markPushGrantDead,
+    grantHostFor: pushGrantHostFor,
     hostLabel: () => hostname(),
     mobilePushEnabled: () => settingsStore.get().mobilePushEnabled !== false,
     mobileLiveActivities: () => settingsStore.get().mobileLiveActivities !== false,
@@ -2363,6 +2490,66 @@ app.whenReady().then(async () => {
   }
 
   /**
+   * Does a remote node's transcript still exist ON THE HOST — `present` / `absent` / `unknown` —
+   * or `null` when this is not a remote session at all (take the local path).
+   *
+   * `remoteTranscriptRefFor` above cannot answer this: it collapses "not a remote session", "no
+   * resolved home", "the ssh call failed" and "the host looked and there is nothing" into one
+   * `undefined`, which is correct for a READER (they all fall back) and wrong for the caller that
+   * acts on absence. `locateRemoteTranscriptCommand` was already written for exactly this
+   * distinction — it exits 0 on a clean miss, "so no transcript is an ANSWER, not a failed ssh"
+   * — and that is the property this reads.
+   *
+   * Every step that cannot decide answers `unknown`, never `absent`. The one caller drops a
+   * `--resume <id>` on `absent`, and a momentarily dead ControlMaster must not be able to look
+   * like a deleted conversation.
+   */
+  const remoteTranscriptPresence = async (
+    sessionId: string,
+    accountId: string | undefined,
+    nodeId: string | undefined
+  ): Promise<TranscriptPresence | null> => {
+    if (!nodeId) return null
+    const rt = ptyManager.sshRemoteForNode(nodeId)
+    // Not a remote session — the caller takes the LOCAL path, which is the right disk to read.
+    if (!rt) return null
+    // From here on the session IS remote, so every failure is `unknown`: falling back to the
+    // local resolver would search this machine for a file that only lives on the host.
+    if (remoteTranscriptBySession.has(sessionId)) return 'present'
+    if (!sshProjectManager) return 'unknown'
+    const remoteHome = sshProjectManager.remoteHomeForControlPath(rt.controlPath)
+    if (!remoteHome) return 'unknown'
+    let accountDir: string | undefined
+    if (accountId) {
+      // A hand-edited project.json can carry any string; the helper validates and throws.
+      try {
+        accountDir = remoteAccountConfigDirAbs(remoteHome, accountId)
+      } catch {
+        accountDir = undefined
+      }
+    }
+    const cmd = locateRemoteTranscriptCommand(
+      remoteTranscriptRoots(remoteHome, accountDir),
+      undefined,
+      sessionId
+    )
+    if (!cmd) return 'unknown'
+    try {
+      const { code, stdout } = await sshProjectManager.sshRun(
+        childArgs(rt.conn, rt.controlPath, cmd)
+      )
+      if (code !== 0) return 'unknown'
+      const located = parseLocatedTranscript(stdout)
+      // Jailed exactly like a hook-supplied path: a located path we would refuse to READ must not
+      // be reported as a transcript that exists either.
+      if (located && isSafeRemoteTranscriptPath(located, remoteHome)) return 'present'
+      return located ? 'unknown' : 'absent'
+    } catch {
+      return 'unknown'
+    }
+  }
+
+  /**
    * Read a remote transcript through a ref, forgetting refs WE located once they stop reading.
    * `cap` is the tail window in bytes; it defaults to the full reader's cap, so every caller that
    * wants a transcript to READ is unchanged. A caller that only wants to know how the last few
@@ -2394,7 +2581,9 @@ app.whenReady().then(async () => {
     readRemote: async ({ sessionId, cwd, accountId, nodeId }) => {
       const ref = await remoteTranscriptRefFor(sessionId, cwd, accountId, nodeId)
       return ref ? await readRemoteTranscript(sessionId!, ref) : null
-    }
+    },
+    remoteExists: async ({ sessionId, accountId, nodeId }) =>
+      sessionId ? await remoteTranscriptPresence(sessionId, accountId, nodeId) : null
   })
 
   initTranscriptIndex(() => settingsStore.get().claudeAccounts ?? [])
@@ -2764,6 +2953,45 @@ app.whenReady().then(async () => {
       if (nodeId && (plan.event === 'stop' || plan.event === 'sessionend')) {
         recordRawToolEvent(nodeId, { hook_event_name: 'Stop' })
       }
+      // 3. SUBAGENT CARDS. Keyed by `subagentId` — the per-instance id, and the ONLY id both
+      // events share. On SubagentStart `sessionId` is the PARENT's; on SubagentStop it is the
+      // CHILD's own. Keying on it would file the start and the stop under different cards, and the
+      // started one would never close: a badge lit forever, with no error to show for it.
+      //
+      // The child's transcript is DERIVED from `subagentId`, never taken from the payload's
+      // `transcriptPath`. On the start that path is the PARENT's session — following it paints the
+      // parent's conversation inside the child's card, full and plausible and somebody else's — and
+      // on the stop the directory is finally the child's but the file is still `updates.jsonl`,
+      // which parses to nothing. Both spellings of that trap are documented at `handoff/locate.ts`.
+      if (g.subagentId && g.cwd) {
+        if (g.event === 'subagentstart') {
+          const childDir = grokSessionDir({
+            sessionsDir: grokSessionsDir(),
+            cwd: g.cwd,
+            sessionId: g.subagentId
+          })
+          if (childDir) {
+            subagentTail.trackFile(
+              g.subagentId,
+              join(childDir, GROK_CHAT_HISTORY_FILE),
+              createGrokSubagentFormatter
+            )
+            if (nodeId) {
+              const set = nodeSubagents.get(nodeId) ?? new Set<string>()
+              set.add(g.subagentId)
+              nodeSubagents.set(nodeId, set)
+            }
+          }
+        } else if (g.event === 'subagentstop') {
+          subagentTail.finish(g.subagentId)
+          if (nodeId) nodeSubagents.get(nodeId)?.delete(g.subagentId)
+        }
+      }
+      // A CHILD's teardown is not this node's. `session_end` carries `subagentType` only in a
+      // subagent session (measured: 2 of the 4 captured ends had it, and those two were the
+      // children). Without this guard a subagent finishing would forget the PARENT's session
+      // directory and clear its context tail — the node would go quiet mid-turn.
+      if (g.event === 'sessionend' && g.subagentType) return
       // Forgetting the MAP entry and untracking the TAIL are two different things and neither
       // substitutes for the other: `applyGrokHookSession` did the first (and does it for PostCompact
       // too, which this call site cannot see). The tail is this shell's, so it is released here.
@@ -2978,7 +3206,10 @@ app.whenReady().then(async () => {
   // which we forward to the renderer and await a reply. A pending-request map (keyed by a random
   // requestId) bridges the two async hops; both the reply and the timeout below clear the entry.
   // The window is generous because a confirm-gated verb waits on a human, not on the renderer.
-  const CONTROL_REQUEST_TIMEOUT_MS = 120_000
+  // IMPORTED, not declared here: the renderer needs the same number to make an agent-requested
+  // confirm dialog collect itself once this timer has already abandoned the request (main sends
+  // no expiry event), and two copies of the deadline is the drift this repo keeps paying for.
+  // See @shared/control-confirm.
   const pendingControl = new Map<
     string,
     {
@@ -3323,7 +3554,10 @@ app.whenReady().then(async () => {
         // an unanswered dialog treated it as a refusal and gave up.
         resolve({
           ok: false,
-          error: `no answer within ${CONTROL_REQUEST_TIMEOUT_MS / 1000}s — the confirmation dialog may still be open; safe to retry`
+          // The dialog is not left behind any more: it carries the same deadline and dismisses
+          // itself (ConfirmState.expiresAt), which is what stops a retry hitting "a confirmation
+          // is already pending" for the rest of the app run.
+          error: `no answer within ${CONTROL_REQUEST_TIMEOUT_MS / 1000}s — the confirmation dialog has been dismissed; safe to retry`
         })
       }, CONTROL_REQUEST_TIMEOUT_MS)
       pendingControl.set(requestId, { resolve, timer })
@@ -3509,6 +3743,23 @@ app.whenReady().then(async () => {
           codex: settingsStore.get().codexAccounts ?? []
         })
       ),
+    // The phone's Board sheet. Two verbs, both landing in the store's own read-modify-write (which
+    // queues them behind save() and announces the result to the renderer, so the canvas adopts the
+    // change live instead of the next autosave reverting it):
+    //
+    //  - `ensureBoard` seeds the default To Do / In Progress / Done columns on a project that has
+    //    never had a `kanban` block. The desktop writes one only on the user's FIRST board edit
+    //    (the lazy default in `lib/kanban.defaultKanban`), which is invisible there — the canvas
+    //    renders the default either way — but left the phone, which knows a project only by its
+    //    file, with no board to show and so no Board button at all on nearly every project.
+    //  - `setCardColumn` moves one card. The phone could already do this over direct SSH, but only
+    //    for a project whose folder is on THIS machine and only while the whole file still fits in
+    //    one argv string.
+    kanban: {
+      ensureBoard: (projectId: string) => workspaceStore.ensureRemoteBoard(projectId),
+      setCardColumn: (projectId: string, nodeId: string, columnId: string | null) =>
+        workspaceStore.setRemoteCardColumn(projectId, nodeId, columnId)
+    },
     // "End session" from the phone (`pty.destroy`): the SAME two steps the desktop × performs —
     // kill the tmux session on every socket it could live on (the sweep may have seen it on either
     // — see the session-memory panel's kill rule), then take the node off its project's canvas
@@ -3743,6 +3994,48 @@ app.whenReady().then(async () => {
     // carries the value the user last saved. 0 (the default) keeps the conf byte-identical.
     () => settingsStore.get().tmuxLeadPaneWidth
   )
+  // Pre-warm the ControlMasters of OPEN SSH projects, in the background, one host at a time.
+  //
+  // Without this the master for a project is dialed only when the user first switches to it, so the
+  // first visit of every app run pays the cold establish (0.44 s at 50 ms RTT) and then the whole
+  // connect-time setup chain (~3.5 s) before a terminal can attach. Both are wall-clock spent in
+  // front of blank panes, and neither depends on the user having switched — so spend it while
+  // nobody is waiting. Measured numbers and the planner's three rules: core/remote-ssh/ssh-prewarm.ts.
+  //
+  // Silent by construction: `prewarm` marks the attempt quiet, so no status event (and therefore no
+  // connection banner) can come out of a project the user is not looking at — and any real connect
+  // for the same project lifts that mark and takes over the attempt.
+  {
+    /** Let the window, the workspace load and the first canvas settle before dialing anything. */
+    const PREWARM_START_MS = 4_000
+    /** Gap between hosts. Sequential dialing already paces the logins; this widens it so a machine
+     *  with many saved servers does not look like a login burst to a shared bastion. */
+    const PREWARM_GAP_MS = 750
+    setTimeout(() => {
+      void (async () => {
+        const mgr = sshProjectManager
+        if (!mgr) return
+        // The index is normally already loaded by boot; load() is idempotent and cheap, and
+        // without it a slow first load would make the pre-warm a no-op for the whole run.
+        // sideline:false — a read-only caller must never rename a mid-merge project.json.
+        await workspaceStore.load({ sideline: false }).catch(() => {})
+        const targets = planSshPrewarm({
+          projects: workspaceStore.openSshProjects(),
+          busy: (projectId) => mgr.isBusy(projectId)
+        })
+        await runSshPrewarm(targets, {
+          connect: (t) => mgr.prewarm(t.projectId, t.conn, t.remoteCwd),
+          busy: (projectId) => mgr.isBusy(projectId),
+          delay: (ms) => new Promise((res) => setTimeout(res, ms)),
+          gapMs: PREWARM_GAP_MS
+          // No `stopped` predicate: nothing here is awaited by a user-facing path, and a dial in
+          // flight is abandoned with the process on quit.
+        })
+      })().catch(() => {
+        // A pre-warm that cannot even be planned changes nothing about how projects connect.
+      })
+    }, PREWARM_START_MS)
+  }
   // Wake-from-sleep: re-validate every SSH master NOW instead of letting ServerAlive discover the
   // dead TCP ~60s later — until it does, every remote terminal looks alive and is dead (no echo,
   // no scroll). The small delay lets the network interface come back up first; connect() is

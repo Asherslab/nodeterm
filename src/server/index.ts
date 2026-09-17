@@ -52,6 +52,7 @@ import { serverEditionControlHandler } from './control-unsupported'
 import { initServerCanvasControl, type ServerCanvasControl } from './canvas-control'
 import { refreshNodeTokens } from '../core/agents/node-token-service'
 import { armServerNodeIdentity } from './node-identity-arm'
+import { wireServerCodexSharedIdentity } from './codex-shared-identity'
 import {
   writePendingAnswerLocal,
   startPendingSweep,
@@ -294,6 +295,9 @@ export async function startServer(
   platform.handle(IPC.ptyCapture, (persistKey: string, full?: boolean) =>
     ptyManager.captureSession(persistKey, full)
   )
+  // The late cold-start check (PtyCreateResult.freshUnverified). Pure core, and this shell runs on
+  // the machine whose tmux it reads, so the answer is as good as the desktop's local one.
+  platform.handle(IPC.ptySessionAge, (persistKey: string) => ptyManager.sessionAgeSeconds(persistKey))
 
   // fs + git + commit handlers (shared with desktop core services). The ticket store is shared
   // between the RPC side (which mints) and the HTTP side (which redeems) — one instance, so a
@@ -598,6 +602,15 @@ export async function startServer(
   } catch (error) {
     console.warn('[node-identity] no secret — hook identity unavailable, running legacy', error)
   }
+
+  // The Server Edition has the same local app-server, signed node tokens, and persistent canvas
+  // store as Electron. Wire the shared-thread spine after those secrets exist, so its Codex panes
+  // get the same daemon-reset supervisor instead of bypassing it through bare `codex`.
+  void wireServerCodexSharedIdentity(
+    hookServer,
+    workspaceStore,
+    (channel, event) => platform.broadcast(channel, event)
+  ).catch((error) => console.warn('[codex-identity] shared identity unavailable:', error))
 
   // Context Link: core owns the whole feature (read handler, shim, skill, instruction blocks) and
   // writes everything under `dataDir`; what it needs from a shell is the link map. The desktop's

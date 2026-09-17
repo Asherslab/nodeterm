@@ -2,7 +2,7 @@
 
 Devin (`devin` on PATH) is a builtin agent id alongside
 claude, codex, gemini, copilot, opencode and grok: `AGENT_CONFIG.devin` in
-`src/shared/agents/config.ts` — label `Devin`, colour `#3969CA`, `launchCmd: 'devin'`,
+`src/shared/agents/config.ts` — label `Devin`, colour `#3969ca`, `launchCmd: 'devin'`,
 `promptInjectionMode: 'argv'`, `argvPromptSeparator: '--'`, `expectedProcess: 'devin'`.
 Status comes from devin's own hooks, never from parsing output.
 
@@ -325,3 +325,8 @@ hook-reported), and no subagent correlation. Devin is therefore in parity by hav
 
 7. **Windows skill/instruction paths** — `devinConfigDir()` switches to `%APPDATA%\devin`, but
    canvas-control and context-link skill writes on Windows are unverified.
+8. **`SessionEnd` on an orderly exit** — devin is in `SESSION_END_CAPABLE` because
+   `normalizeDevin` maps its documented `SessionEnd` event, and that list is derived from the
+   normalizers. Whether devin actually fires `SessionEnd` on `/exit` has not been captured. If it
+   does not, the DROPPED chip (`terminal/agent-liveness.ts`) would read every deliberate `/exit` as
+   a crash — remove the normalizer branch and the list entry together.
